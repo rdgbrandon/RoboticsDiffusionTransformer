@@ -275,3 +275,89 @@ class RoboticDiffusionTransformerModel(object):
         trajectory = self._unformat_action_to_joint(trajectory).to(torch.float32)
 
         return trajectory
+
+    # @torch.no_grad() 
+    # WE WANT GRAD becaus IG requires it
+    def info_step(self, proprio, images, text_embeds):
+        """
+        Args:
+            proprio: proprioceptive states
+            images: RGB images
+            text_embeds: instruction embeddings
+
+        Returns:
+            action: predicted action
+        """
+        device = self.device
+        dtype = self.dtype
+        
+        background_color = np.array([
+            int(x*255) for x in self.image_processor.image_mean
+        ], dtype=np.uint8).reshape(1, 1, 3)
+        background_image = np.ones((
+            self.image_processor.size["height"], 
+            self.image_processor.size["width"], 3), dtype=np.uint8
+        ) * background_color
+        
+        image_tensor_list = []
+        for image in images:
+            if image is None:
+                # Replace it with the background image
+                image = Image.fromarray(background_image)
+            
+            if self.image_size is not None:
+                image = transforms.Resize(self.data_args.image_size)(image)
+            
+            if self.args["dataset"].get("auto_adjust_image_brightness", False):
+                pixel_values = list(image.getdata())
+                average_brightness = sum(sum(pixel) for pixel in pixel_values) / (len(pixel_values) * 255.0 * 3)
+                if average_brightness <= 0.15:
+                    image = transforms.ColorJitter(brightness=(1.75,1.75))(image)
+                    
+            if self.args["dataset"].get("image_aspect_ratio", "pad") == 'pad':
+                def expand2square(pil_img, background_color):
+                    width, height = pil_img.size
+                    if width == height:
+                        return pil_img
+                    elif width > height:
+                        result = Image.new(pil_img.mode, (width, width), background_color)
+                        result.paste(pil_img, (0, (width - height) // 2))
+                        return result
+                    else:
+                        result = Image.new(pil_img.mode, (height, height), background_color)
+                        result.paste(pil_img, ((height - width) // 2, 0))
+                        return result
+                image = expand2square(image, tuple(int(x*255) for x in self.image_processor.image_mean))
+            image = self.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            image_tensor_list.append(image)
+
+        image_tensor = torch.stack(image_tensor_list, dim=0).to(device, dtype=dtype)
+
+        image_embeds = self.vision_model(image_tensor).detach()
+        image_embeds = image_embeds.reshape(-1, self.vision_model.hidden_size).unsqueeze(0)
+
+        # history of actions
+        joints = proprio.to(device).unsqueeze(0)   # (1, 1, 14)
+        states, state_elem_mask = self._format_joint_to_state(joints)    # (1, 1, 128), (1, 128)
+        states, state_elem_mask = states.to(device, dtype=dtype), state_elem_mask.to(device, dtype=dtype)
+        states = states[:, -1:, :]  # (1, 1, 128)
+        ctrl_freqs = torch.tensor([self.control_frequency]).to(device)
+        
+        text_embeds = text_embeds.to(device, dtype=dtype)
+        
+        # for each time step the model predicts a short horizon tranjectory of actions
+        raw_trajectory = self.policy.predict_action(
+            lang_tokens=text_embeds,
+            lang_attn_mask=torch.ones(
+                text_embeds.shape[:2], dtype=torch.bool,
+                device=text_embeds.device),
+            img_tokens=image_embeds,
+            state_tokens=states,
+            action_mask=state_elem_mask.unsqueeze(1),  
+            ctrl_freqs=ctrl_freqs
+        )
+
+
+        trajectory = self._unformat_action_to_joint(raw_trajectory).to(torch.float32)
+
+        return trajectory, raw_trajectory
