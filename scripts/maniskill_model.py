@@ -194,43 +194,50 @@ class RoboticDiffusionTransformerModel(object):
         
         return joints
 
-    @torch.no_grad()
-    def step(self, proprio, images, text_embeds):
+    def preprocess_inputs(self, proprio, images, text_embeds):
         """
+        Preprocess inputs and return all PyTorch tensors needed for inference.
+
         Args:
             proprio: proprioceptive states
             images: RGB images
             text_embeds: instruction embeddings
 
         Returns:
-            action: predicted action
+            dict: Dictionary containing all preprocessed tensors:
+                - image_embeds: processed image embeddings
+                - states: formatted proprioceptive states
+                - state_elem_mask: state element mask
+                - text_embeds: text embeddings
+                - ctrl_freqs: control frequencies
+                - lang_attn_mask: language attention mask
         """
         device = self.device
         dtype = self.dtype
-        
+
         background_color = np.array([
             int(x*255) for x in self.image_processor.image_mean
         ], dtype=np.uint8).reshape(1, 1, 3)
         background_image = np.ones((
-            self.image_processor.size["height"], 
+            self.image_processor.size["height"],
             self.image_processor.size["width"], 3), dtype=np.uint8
         ) * background_color
-        
+
         image_tensor_list = []
         for image in images:
             if image is None:
                 # Replace it with the background image
                 image = Image.fromarray(background_image)
-            
+
             if self.image_size is not None:
                 image = transforms.Resize(self.data_args.image_size)(image)
-            
+
             if self.args["dataset"].get("auto_adjust_image_brightness", False):
                 pixel_values = list(image.getdata())
                 average_brightness = sum(sum(pixel) for pixel in pixel_values) / (len(pixel_values) * 255.0 * 3)
                 if average_brightness <= 0.15:
                     image = transforms.ColorJitter(brightness=(1.75,1.75))(image)
-                    
+
             if self.args["dataset"].get("image_aspect_ratio", "pad") == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -259,18 +266,44 @@ class RoboticDiffusionTransformerModel(object):
         states, state_elem_mask = states.to(device, dtype=dtype), state_elem_mask.to(device, dtype=dtype)
         states = states[:, -1:, :]  # (1, 1, 128)
         ctrl_freqs = torch.tensor([self.control_frequency]).to(device)
-        
+
         text_embeds = text_embeds.to(device, dtype=dtype)
-        
+
+        lang_attn_mask = torch.ones(
+            text_embeds.shape[:2], dtype=torch.bool,
+            device=text_embeds.device
+        )
+
+        return {
+            'image_embeds': image_embeds,
+            'states': states,
+            'state_elem_mask': state_elem_mask,
+            'text_embeds': text_embeds,
+            'ctrl_freqs': ctrl_freqs,
+            'lang_attn_mask': lang_attn_mask
+        }
+
+    @torch.no_grad()
+    def step(self, proprio, images, text_embeds):
+        """
+        Args:
+            proprio: proprioceptive states
+            images: RGB images
+            text_embeds: instruction embeddings
+
+        Returns:
+            action: predicted action
+        """
+        # Preprocess inputs to get all required tensors
+        preprocessed = self.preprocess_inputs(proprio, images, text_embeds)
+
         trajectory = self.policy.predict_action(
-            lang_tokens=text_embeds,
-            lang_attn_mask=torch.ones(
-                text_embeds.shape[:2], dtype=torch.bool,
-                device=text_embeds.device),
-            img_tokens=image_embeds,
-            state_tokens=states,
-            action_mask=state_elem_mask.unsqueeze(1),  
-            ctrl_freqs=ctrl_freqs
+            lang_tokens=preprocessed['text_embeds'],
+            lang_attn_mask=preprocessed['lang_attn_mask'],
+            img_tokens=preprocessed['image_embeds'],
+            state_tokens=preprocessed['states'],
+            action_mask=preprocessed['state_elem_mask'].unsqueeze(1),
+            ctrl_freqs=preprocessed['ctrl_freqs']
         )
         trajectory = self._unformat_action_to_joint(trajectory).to(torch.float32)
 
